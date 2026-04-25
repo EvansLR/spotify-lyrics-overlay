@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Spotify Lyrics Overlay</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="overlay">
+      <section id="setup" class="setup">
+        <h1>Spotify Lyrics</h1>
+        <p>Set Redirect URI to <code>http://127.0.0.1:8766/callback</code> in Spotify Developer Dashboard.</p>
+        <input id="clientId" placeholder="Spotify Client ID" autocomplete="off" spellcheck="false" />
+        <div class="setup-actions">
+          <button id="connect">Connect</button>
+          <button id="quitSetup" class="secondary">Quit</button>
+        </div>
+        <p id="setupStatus" class="status"></p>
+      </section>
+
+      <section id="lyricsView" class="lyrics-view is-hidden">
+        <div class="toolbar">
+          <div class="track">
+            <strong id="trackTitle">Waiting for Spotify</strong>
+            <span id="trackArtist">Play a song in Spotify.</span>
+          </div>
+          <div class="toolbar-actions">
+            <button id="lineModeToggle" class="secondary">2 lines</button>
+            <button id="lockToggle" class="secondary">Lock</button>
+            <button id="disconnect" class="secondary">Disconnect</button>
+            <button id="quit" class="secondary">Quit</button>
+          </div>
+        </div>
+        <p class="hint">Ctrl+Alt+L toggles lock</p>
+        <button id="unlockButton" class="unlock-button is-hidden" aria-label="Unlock lyrics">Lock</button>
+        <div id="lyrics" class="lyrics">
+          <div class="line current">Waiting for playback...</div>
+          <div class="line next"></div>
+        </div>
+      </section>
+    </main>
+    <script src="renderer.js"></script>
+  </body>
+</html>

@@ -1,0 +1,458 @@
+const { app, BrowserWindow, ipcMain, shell, globalShortcut, screen } = require("electron");
+const http = require("node:http");
+const path = require("node:path");
+const fs = require("node:fs/promises");
+const crypto = require("node:crypto");
+
+const SPOTIFY_AUTH_URL = "https://accounts.spotify.com/authorize";
+const SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token";
+const SPOTIFY_API = "https://api.spotify.com/v1";
+const REDIRECT_URI = "http://127.0.0.1:8766/callback";
+const SCOPES = ["user-read-currently-playing", "user-read-playback-state"];
+
+let mainWindow;
+let unlockWindow;
+let authServer;
+let pkceVerifier = "";
+let unlockPollTimer;
+
+function userFile(name) {
+  return path.join(app.getPath("userData"), name);
+}
+
+async function readJson(name, fallback = null) {
+  try {
+    return JSON.parse(await fs.readFile(userFile(name), "utf8"));
+  } catch {
+    return fallback;
+  }
+}
+
+async function writeJson(name, data) {
+  await fs.mkdir(app.getPath("userData"), { recursive: true });
+  await fs.writeFile(userFile(name), JSON.stringify(data, null, 2), "utf8");
+}
+
+async function removeFile(name) {
+  try {
+    await fs.unlink(userFile(name));
+  } catch {
+    // Already gone.
+  }
+}
+
+function createWindow() {
+  mainWindow = new BrowserWindow({
+    width: 900,
+    height: 220,
+    minWidth: 420,
+    minHeight: 150,
+    frame: false,
+    transparent: true,
+    alwaysOnTop: true,
+    skipTaskbar: false,
+    hasShadow: false,
+    resizable: true,
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+
+  mainWindow.setAlwaysOnTop(true, "screen-saver");
+  mainWindow.loadFile("index.html");
+  mainWindow.on("closed", () => {
+    stopUnlockHover();
+    mainWindow = null;
+  });
+  createUnlockWindow();
+}
+
+function createUnlockWindow() {
+  unlockWindow = new BrowserWindow({
+    width: 46,
+    height: 46,
+    frame: false,
+    transparent: true,
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    resizable: false,
+    show: false,
+    hasShadow: false,
+    webPreferences: {
+      preload: path.join(__dirname, "unlock-preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+  unlockWindow.setAlwaysOnTop(true, "screen-saver");
+  unlockWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(`
+    <!doctype html>
+    <html>
+      <head>
+        <style>
+          html, body {
+            width: 100%;
+            height: 100%;
+            margin: 0;
+            background: transparent;
+            overflow: hidden;
+            font-family: system-ui, sans-serif;
+          }
+          button {
+            position: relative;
+            width: 38px;
+            height: 38px;
+            margin: 4px;
+            border: 1px solid rgba(255,255,255,.18);
+            border-radius: 8px;
+            background: rgba(5,8,6,.42);
+            backdrop-filter: blur(12px);
+            cursor: pointer;
+          }
+          button::before {
+            content: "";
+            position: absolute;
+            left: 50%;
+            top: 19px;
+            width: 14px;
+            height: 11px;
+            border: 2px solid rgba(246,255,248,.78);
+            border-radius: 3px;
+            transform: translateX(-50%);
+          }
+          button::after {
+            content: "";
+            position: absolute;
+            left: 50%;
+            top: 8px;
+            width: 13px;
+            height: 13px;
+            border: 2px solid rgba(246,255,248,.78);
+            border-bottom: 0;
+            border-radius: 10px 10px 0 0;
+            transform: translateX(-50%);
+          }
+          button:hover {
+            background: rgba(30,215,96,.25);
+          }
+        </style>
+      </head>
+      <body>
+        <button title="Unlock"></button>
+        <script>
+          document.querySelector("button").addEventListener("click", () => window.unlockApi.unlock());
+        </script>
+      </body>
+    </html>
+  `)}`);
+  unlockWindow.on("closed", () => {
+    unlockWindow = null;
+  });
+}
+
+function registerShortcuts() {
+  globalShortcut.register("Control+Alt+L", () => {
+    mainWindow?.webContents.send("lock:toggle");
+  });
+}
+
+function randomString(length) {
+  return crypto.randomBytes(length).toString("base64url").slice(0, length);
+}
+
+function sha256Base64Url(value) {
+  return crypto.createHash("sha256").update(value).digest("base64url");
+}
+
+async function startAuth(clientId) {
+  if (!clientId) throw new Error("Client ID is required.");
+  await writeJson("config.json", { clientId });
+
+  pkceVerifier = randomString(96);
+  const codeChallenge = sha256Base64Url(pkceVerifier);
+
+  await stopAuthServer();
+  authServer = http.createServer(async (req, res) => {
+    const url = new URL(req.url, REDIRECT_URI);
+    if (url.pathname !== "/callback") {
+      res.writeHead(404);
+      res.end("Not found");
+      return;
+    }
+
+    const code = url.searchParams.get("code");
+    const error = url.searchParams.get("error");
+    if (error || !code) {
+      res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end(error || "Missing code");
+      mainWindow?.webContents.send("auth:error", error || "Missing authorization code");
+      return;
+    }
+
+    try {
+      await exchangeCode(clientId, code);
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end("<h1>Spotify connected</h1><p>You can close this tab.</p>");
+      mainWindow?.webContents.send("auth:success");
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end(err.message);
+      mainWindow?.webContents.send("auth:error", err.message);
+    } finally {
+      stopAuthServer();
+    }
+  });
+
+  await new Promise((resolve, reject) => {
+    authServer.once("error", reject);
+    authServer.listen(8766, "127.0.0.1", resolve);
+  });
+
+  const authUrl = new URL(SPOTIFY_AUTH_URL);
+  authUrl.search = new URLSearchParams({
+    response_type: "code",
+    client_id: clientId,
+    scope: SCOPES.join(" "),
+    redirect_uri: REDIRECT_URI,
+    code_challenge_method: "S256",
+    code_challenge: codeChallenge,
+  }).toString();
+
+  await shell.openExternal(authUrl.toString());
+}
+
+async function stopAuthServer() {
+  if (!authServer) return;
+  const server = authServer;
+  authServer = null;
+  await new Promise((resolve) => server.close(resolve));
+}
+
+async function exchangeCode(clientId, code) {
+  const response = await fetch(SPOTIFY_TOKEN_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "authorization_code",
+      code,
+      redirect_uri: REDIRECT_URI,
+      client_id: clientId,
+      code_verifier: pkceVerifier,
+    }),
+  });
+
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error_description || data.error || "Token exchange failed.");
+  await storeToken(data);
+}
+
+async function storeToken(data) {
+  const current = await readJson("token.json", {});
+  await writeJson("token.json", {
+    access_token: data.access_token,
+    refresh_token: data.refresh_token || current.refresh_token,
+    expires_at: Date.now() + Number(data.expires_in || 3600) * 1000,
+  });
+}
+
+async function getConfig() {
+  return readJson("config.json", {});
+}
+
+async function getToken() {
+  const token = await readJson("token.json", null);
+  if (!token) return null;
+  if (Date.now() < token.expires_at - 60000) return token;
+
+  const { clientId } = await getConfig();
+  if (!clientId || !token.refresh_token) return null;
+
+  const response = await fetch(SPOTIFY_TOKEN_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: token.refresh_token,
+      client_id: clientId,
+    }),
+  });
+
+  const data = await response.json();
+  if (!response.ok) {
+    await removeFile("token.json");
+    throw new Error(data.error_description || data.error || "Could not refresh Spotify token.");
+  }
+
+  await storeToken(data);
+  return readJson("token.json", null);
+}
+
+async function spotifyGet(pathname) {
+  const token = await getToken();
+  if (!token) return null;
+
+  const response = await fetch(`${SPOTIFY_API}${pathname}`, {
+    headers: { Authorization: `Bearer ${token.access_token}` },
+  });
+
+  if (response.status === 204 || response.status === 404) return null;
+  if (!response.ok) {
+    const data = await response.json().catch(() => null);
+    throw new Error(data?.error?.message || "Spotify request failed.");
+  }
+  return response.json();
+}
+
+function normalizeTrack(player) {
+  const item = player?.item;
+  if (!item || item.type !== "track") return null;
+  return {
+    id: item.id,
+    name: item.name,
+    artist: item.artists?.map((artist) => artist.name).join(", ") || "",
+    firstArtist: item.artists?.[0]?.name || "",
+    album: item.album?.name || "",
+    durationMs: item.duration_ms || 0,
+    progressMs: player.progress_ms || 0,
+    isPlaying: Boolean(player.is_playing),
+  };
+}
+
+async function getPlayer() {
+  const player = await spotifyGet("/me/player");
+  return normalizeTrack(player);
+}
+
+async function getLyrics(track) {
+  if (!track?.id) return { lines: [], plain: [], source: "none" };
+
+  const cache = await readJson("lyrics-cache.json", {});
+  if (cache[track.id]) return cache[track.id];
+
+  const params = new URLSearchParams({
+    track_name: track.name,
+    artist_name: track.firstArtist || track.artist,
+  });
+  if (track.album) params.set("album_name", track.album);
+  if (track.durationMs) params.set("duration", String(Math.round(track.durationMs / 1000)));
+
+  const response = await fetch(`https://lrclib.net/api/get?${params.toString()}`, {
+    headers: { Accept: "application/json" },
+  });
+  if (!response.ok) {
+    const result = { lines: [], plain: [], source: "none" };
+    cache[track.id] = result;
+    await writeJson("lyrics-cache.json", cache);
+    return result;
+  }
+
+  const data = await response.json();
+  const result = data.syncedLyrics
+    ? { lines: parseLrc(data.syncedLyrics), plain: [], source: "synced" }
+    : { lines: [], plain: (data.plainLyrics || "").split(/\r?\n/).filter(Boolean), source: data.plainLyrics ? "plain" : "none" };
+
+  cache[track.id] = result;
+  await writeJson("lyrics-cache.json", cache);
+  return result;
+}
+
+function parseLrc(text) {
+  const lines = [];
+  for (const raw of text.split(/\r?\n/)) {
+    const matches = Array.from(raw.matchAll(/\[(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?\]/g));
+    if (!matches.length) continue;
+    const lyric = raw.replace(/\[[^\]]+\]/g, "").trim();
+    for (const match of matches) {
+      const minutes = Number(match[1]);
+      const seconds = Number(match[2]);
+      const fraction = Number((match[3] || "0").padEnd(3, "0"));
+      lines.push({ time: minutes * 60000 + seconds * 1000 + fraction, text: lyric });
+    }
+  }
+  return lines.sort((a, b) => a.time - b.time);
+}
+
+ipcMain.handle("auth:start", (_event, clientId) => startAuth(clientId));
+ipcMain.handle("auth:disconnect", async () => {
+  await removeFile("token.json");
+  return true;
+});
+ipcMain.handle("auth:status", async () => {
+  const config = await getConfig();
+  const token = await readJson("token.json", null);
+  return { connected: Boolean(token), clientId: config.clientId || "" };
+});
+ipcMain.handle("spotify:player", getPlayer);
+ipcMain.handle("lyrics:get", (_event, track) => getLyrics(track));
+ipcMain.handle("window:set-click-through", (_event, enabled) => {
+  setMainClickThrough(Boolean(enabled));
+});
+ipcMain.handle("window:quit", () => app.quit());
+ipcMain.handle("lock-button:unlock", () => {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.setIgnoreMouseEvents(false);
+  stopUnlockHover();
+  if (unlockWindow && !unlockWindow.isDestroyed()) unlockWindow.hide();
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("lock:set", false);
+});
+
+function setMainClickThrough(enabled) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.setIgnoreMouseEvents(enabled, { forward: true });
+  if (enabled) startUnlockHover();
+  else {
+    stopUnlockHover();
+    if (unlockWindow && !unlockWindow.isDestroyed()) unlockWindow.hide();
+  }
+}
+
+function startUnlockHover() {
+  stopUnlockHover();
+  unlockPollTimer = setInterval(() => {
+    if (!mainWindow || !unlockWindow || mainWindow.isDestroyed() || unlockWindow.isDestroyed()) {
+      stopUnlockHover();
+      return;
+    }
+    const point = screen.getCursorScreenPoint();
+    const bounds = mainWindow.getBounds();
+    const inside =
+      point.x >= bounds.x &&
+      point.x <= bounds.x + bounds.width &&
+      point.y >= bounds.y &&
+      point.y <= bounds.y + bounds.height;
+
+    if (inside) {
+      if (unlockWindow.isDestroyed()) return;
+      unlockWindow.setBounds({
+        x: bounds.x + bounds.width - 58,
+        y: bounds.y + 12,
+        width: 46,
+        height: 46,
+      });
+      if (!unlockWindow.isVisible()) unlockWindow.showInactive();
+    } else if (!unlockWindow.isDestroyed() && unlockWindow.isVisible()) {
+      unlockWindow.hide();
+    }
+  }, 120);
+}
+
+function stopUnlockHover() {
+  if (!unlockPollTimer) return;
+  clearInterval(unlockPollTimer);
+  unlockPollTimer = null;
+}
+
+app.whenReady().then(() => {
+  createWindow();
+  registerShortcuts();
+});
+
+app.on("will-quit", () => {
+  stopUnlockHover();
+  globalShortcut.unregisterAll();
+});
+
+app.on("window-all-closed", () => {
+  if (process.platform !== "darwin") app.quit();
+});
