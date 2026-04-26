@@ -9,6 +9,10 @@ const SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token";
 const SPOTIFY_API = "https://api.spotify.com/v1";
 const REDIRECT_URI = "http://127.0.0.1:8766/callback";
 const SCOPES = ["user-read-currently-playing", "user-read-playback-state"];
+const REQUEST_TIMEOUT_MS = 10000;
+const LYRICS_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const LYRICS_NONE_TTL_MS = 6 * 60 * 60 * 1000;
+const MAX_LYRICS_CACHE_ENTRIES = 500;
 
 let mainWindow;
 let unlockWindow;
@@ -18,6 +22,28 @@ let unlockPollTimer;
 
 function userFile(name) {
   return path.join(app.getPath("userData"), name);
+}
+
+function sendToMainWindow(channel, ...args) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.send(channel, ...args);
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = REQUEST_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (err) {
+    if (err.name === "AbortError") throw new Error("Network request timed out.");
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function readResponseJson(response) {
+  return response.json().catch(() => null);
 }
 
 async function readJson(name, fallback = null) {
@@ -154,7 +180,7 @@ function createUnlockWindow() {
 
 function registerShortcuts() {
   globalShortcut.register("Control+Alt+L", () => {
-    mainWindow?.webContents.send("lock:toggle");
+    sendToMainWindow("lock:toggle");
   });
 }
 
@@ -187,7 +213,7 @@ async function startAuth(clientId) {
     if (error || !code) {
       res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
       res.end(error || "Missing code");
-      mainWindow?.webContents.send("auth:error", error || "Missing authorization code");
+      sendToMainWindow("auth:error", error || "Missing authorization code");
       return;
     }
 
@@ -195,13 +221,13 @@ async function startAuth(clientId) {
       await exchangeCode(clientId, code);
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       res.end("<h1>Spotify connected</h1><p>You can close this tab.</p>");
-      mainWindow?.webContents.send("auth:success");
+      sendToMainWindow("auth:success");
     } catch (err) {
       res.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
       res.end(err.message);
-      mainWindow?.webContents.send("auth:error", err.message);
+      sendToMainWindow("auth:error", err.message);
     } finally {
-      stopAuthServer();
+      await stopAuthServer();
     }
   });
 
@@ -231,7 +257,7 @@ async function stopAuthServer() {
 }
 
 async function exchangeCode(clientId, code) {
-  const response = await fetch(SPOTIFY_TOKEN_URL, {
+  const response = await fetchWithTimeout(SPOTIFY_TOKEN_URL, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
@@ -243,8 +269,9 @@ async function exchangeCode(clientId, code) {
     }),
   });
 
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error_description || data.error || "Token exchange failed.");
+  const data = await readResponseJson(response);
+  if (!response.ok) throw new Error(data?.error_description || data?.error || "Token exchange failed.");
+  if (!data?.access_token) throw new Error("Spotify did not return an access token.");
   await storeToken(data);
 }
 
@@ -269,7 +296,7 @@ async function getToken() {
   const { clientId } = await getConfig();
   if (!clientId || !token.refresh_token) return null;
 
-  const response = await fetch(SPOTIFY_TOKEN_URL, {
+  const response = await fetchWithTimeout(SPOTIFY_TOKEN_URL, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
@@ -279,12 +306,15 @@ async function getToken() {
     }),
   });
 
-  const data = await response.json();
+  const data = await readResponseJson(response);
   if (!response.ok) {
-    await removeFile("token.json");
-    throw new Error(data.error_description || data.error || "Could not refresh Spotify token.");
+    if (response.status === 400 || response.status === 401 || data?.error === "invalid_grant") {
+      await removeFile("token.json");
+    }
+    throw new Error(data?.error_description || data?.error || "Could not refresh Spotify token.");
   }
 
+  if (!data?.access_token) throw new Error("Spotify did not return an access token.");
   await storeToken(data);
   return readJson("token.json", null);
 }
@@ -293,16 +323,17 @@ async function spotifyGet(pathname) {
   const token = await getToken();
   if (!token) return null;
 
-  const response = await fetch(`${SPOTIFY_API}${pathname}`, {
+  const response = await fetchWithTimeout(`${SPOTIFY_API}${pathname}`, {
     headers: { Authorization: `Bearer ${token.access_token}` },
   });
 
   if (response.status === 204 || response.status === 404) return null;
+  if (response.status === 401) await removeFile("token.json");
   if (!response.ok) {
-    const data = await response.json().catch(() => null);
+    const data = await readResponseJson(response);
     throw new Error(data?.error?.message || "Spotify request failed.");
   }
-  return response.json();
+  return readResponseJson(response);
 }
 
 function normalizeTrack(player) {
@@ -329,7 +360,8 @@ async function getLyrics(track) {
   if (!track?.id) return { lines: [], plain: [], source: "none" };
 
   const cache = await readJson("lyrics-cache.json", {});
-  if (cache[track.id]) return cache[track.id];
+  const cached = getCachedLyrics(cache, track.id);
+  if (cached) return cached;
 
   const params = new URLSearchParams({
     track_name: track.name,
@@ -338,24 +370,65 @@ async function getLyrics(track) {
   if (track.album) params.set("album_name", track.album);
   if (track.durationMs) params.set("duration", String(Math.round(track.durationMs / 1000)));
 
-  const response = await fetch(`https://lrclib.net/api/get?${params.toString()}`, {
+  const response = await fetchWithTimeout(`https://lrclib.net/api/get?${params.toString()}`, {
     headers: { Accept: "application/json" },
   });
   if (!response.ok) {
     const result = { lines: [], plain: [], source: "none" };
-    cache[track.id] = result;
-    await writeJson("lyrics-cache.json", cache);
+    if (response.status === 404) await setCachedLyrics(cache, track.id, result, LYRICS_NONE_TTL_MS);
     return result;
   }
 
-  const data = await response.json();
+  const data = await readResponseJson(response);
+  if (!isLikelyLyricMatch(track, data)) {
+    const result = { lines: [], plain: [], source: "none" };
+    await setCachedLyrics(cache, track.id, result, LYRICS_NONE_TTL_MS);
+    return result;
+  }
+
   const result = data.syncedLyrics
     ? { lines: parseLrc(data.syncedLyrics), plain: [], source: "synced" }
     : { lines: [], plain: (data.plainLyrics || "").split(/\r?\n/).filter(Boolean), source: data.plainLyrics ? "plain" : "none" };
 
-  cache[track.id] = result;
-  await writeJson("lyrics-cache.json", cache);
+  await setCachedLyrics(cache, track.id, result, result.source === "none" ? LYRICS_NONE_TTL_MS : LYRICS_CACHE_TTL_MS);
   return result;
+}
+
+function getCachedLyrics(cache, trackId) {
+  const entry = cache[trackId];
+  if (!entry) return null;
+
+  if (entry.result) {
+    const maxAge = Number(entry.ttlMs || 0) || (entry.result.source === "none" ? LYRICS_NONE_TTL_MS : LYRICS_CACHE_TTL_MS);
+    if (Date.now() - Number(entry.savedAt || 0) < maxAge) return entry.result;
+    delete cache[trackId];
+    return null;
+  }
+
+  delete cache[trackId];
+  return null;
+}
+
+async function setCachedLyrics(cache, trackId, result, ttlMs) {
+  cache[trackId] = { savedAt: Date.now(), ttlMs, result };
+  const entries = Object.entries(cache);
+  if (entries.length > MAX_LYRICS_CACHE_ENTRIES) {
+    entries
+      .sort(([, a], [, b]) => Number(a?.savedAt || 0) - Number(b?.savedAt || 0))
+      .slice(0, entries.length - MAX_LYRICS_CACHE_ENTRIES)
+      .forEach(([key]) => delete cache[key]);
+  }
+  await writeJson("lyrics-cache.json", cache);
+}
+
+function isLikelyLyricMatch(track, data) {
+  if (!data) return false;
+  const returnedDuration = Number(data.duration || 0);
+  if (returnedDuration && track.durationMs) {
+    const expectedDuration = track.durationMs / 1000;
+    if (Math.abs(returnedDuration - expectedDuration) > 5) return false;
+  }
+  return true;
 }
 
 function parseLrc(text) {
@@ -394,7 +467,7 @@ ipcMain.handle("lock-button:unlock", () => {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.setIgnoreMouseEvents(false);
   stopUnlockHover();
   if (unlockWindow && !unlockWindow.isDestroyed()) unlockWindow.hide();
-  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("lock:set", false);
+  sendToMainWindow("lock:set", false);
 });
 
 function setMainClickThrough(enabled) {
