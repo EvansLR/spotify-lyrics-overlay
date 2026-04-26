@@ -68,7 +68,7 @@ npm.cmd run dist
 The installer will be generated in:
 
 ```text
-dist/Spotify Lyrics Overlay Setup 0.1.0.exe
+dist/Spotify Lyrics Overlay Setup 0.1.2.exe
 ```
 
 This project currently builds an unsigned installer. Windows may show an unknown publisher warning. A production release should use a valid code signing certificate.
