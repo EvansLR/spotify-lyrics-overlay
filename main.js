@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, shell, globalShortcut, screen } = require("electron");
+const { app, BrowserWindow, ipcMain, shell, globalShortcut, screen, Tray, Menu, nativeImage } = require("electron");
 const http = require("node:http");
 const path = require("node:path");
 const fs = require("node:fs/promises");
@@ -16,9 +16,15 @@ const MAX_LYRICS_CACHE_ENTRIES = 500;
 
 let mainWindow;
 let unlockWindow;
+let tray;
 let authServer;
 let pkceVerifier = "";
 let unlockPollTimer;
+let isQuitting = false;
+
+function appFile(...segments) {
+  return path.join(__dirname, ...segments);
+}
 
 function userFile(name) {
   return path.join(app.getPath("userData"), name);
@@ -76,9 +82,10 @@ function createWindow() {
     frame: false,
     transparent: true,
     alwaysOnTop: true,
-    skipTaskbar: false,
+    skipTaskbar: true,
     hasShadow: false,
     resizable: true,
+    icon: appFile("assets", "icon.png"),
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
@@ -88,11 +95,47 @@ function createWindow() {
 
   mainWindow.setAlwaysOnTop(true, "screen-saver");
   mainWindow.loadFile("index.html");
+  mainWindow.on("close", (event) => {
+    if (isQuitting) return;
+    event.preventDefault();
+    mainWindow.hide();
+  });
   mainWindow.on("closed", () => {
     stopUnlockHover();
     mainWindow = null;
   });
   createUnlockWindow();
+}
+
+function createTray() {
+  if (tray) return;
+  tray = new Tray(createTrayIcon());
+  tray.setToolTip("Spotify Lyrics Overlay");
+  tray.setContextMenu(createTrayMenu());
+  tray.on("click", toggleMainWindow);
+}
+
+function createTrayIcon() {
+  return nativeImage.createFromPath(appFile("assets", "icon.png")).resize({ width: 16, height: 16 });
+}
+
+function createTrayMenu() {
+  return Menu.buildFromTemplate([
+    { label: "Show / Hide", click: toggleMainWindow },
+    { type: "separator" },
+    { label: "Quit", click: quitApp },
+  ]);
+}
+
+function toggleMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (mainWindow.isVisible()) {
+    mainWindow.hide();
+    return;
+  }
+  mainWindow.show();
+  mainWindow.focus();
+  mainWindow.setAlwaysOnTop(true, "screen-saver");
 }
 
 function createUnlockWindow() {
@@ -462,7 +505,7 @@ ipcMain.handle("lyrics:get", (_event, track) => getLyrics(track));
 ipcMain.handle("window:set-click-through", (_event, enabled) => {
   setMainClickThrough(Boolean(enabled));
 });
-ipcMain.handle("window:quit", () => app.quit());
+ipcMain.handle("window:quit", quitApp);
 ipcMain.handle("lock-button:unlock", () => {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.setIgnoreMouseEvents(false);
   stopUnlockHover();
@@ -518,13 +561,20 @@ function stopUnlockHover() {
 
 app.whenReady().then(() => {
   createWindow();
+  createTray();
   registerShortcuts();
 });
 
 app.on("will-quit", () => {
+  isQuitting = true;
   stopUnlockHover();
   globalShortcut.unregisterAll();
 });
+
+function quitApp() {
+  isQuitting = true;
+  app.quit();
+}
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();

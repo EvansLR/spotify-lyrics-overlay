@@ -1,6 +1,6 @@
 {
   "name": "spotify-lyrics-overlay",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Minimal desktop lyrics overlay for Spotify using LRCLIB.",
   "main": "main.js",
   "license": "MIT",
@@ -11,8 +11,9 @@
   },
   "author": "Spotify Lyrics Overlay",
   "build": {
-    "appId": "com.local.spotify-lyrics-overlay",
+    "appId": "io.github.evanslr.spotify-lyrics-overlay",
     "productName": "Spotify Lyrics Overlay",
+    "afterPack": "scripts/after-pack.js",
     "directories": {
       "output": "dist"
     },
@@ -23,9 +24,12 @@
       "renderer.js",
       "index.html",
       "styles.css",
-      "package.json"
+      "package.json",
+      "assets/**/*",
+      "scripts/after-pack.js"
     ],
     "win": {
+      "icon": "assets/icon.ico",
       "signAndEditExecutable": false,
       "verifyUpdateCodeSignature": false,
       "target": [
@@ -33,6 +37,9 @@
       ]
     },
     "nsis": {
+      "installerIcon": "assets/icon.ico",
+      "uninstallerIcon": "assets/icon.ico",
+      "installerHeaderIcon": "assets/icon.ico",
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
@@ -42,6 +49,7 @@
   },
   "devDependencies": {
     "electron": "^32.0.0",
-    "electron-builder": "^25.1.8"
+    "electron-builder": "^25.1.8",
+    "rcedit": "^5.0.1"
   }
 }
