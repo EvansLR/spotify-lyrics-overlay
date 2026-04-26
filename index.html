@@ -26,11 +26,23 @@
             <span id="trackArtist">Play a song in Spotify.</span>
           </div>
           <div class="toolbar-actions">
+            <button id="styleToggle" class="secondary">Style</button>
             <button id="lineModeToggle" class="secondary">2 lines</button>
             <button id="lockToggle" class="secondary">Lock</button>
             <button id="disconnect" class="secondary">Disconnect</button>
             <button id="quit" class="secondary">Quit</button>
           </div>
+        </div>
+        <div id="stylePanel" class="style-panel is-hidden">
+          <label>
+            <span>Size</span>
+            <input id="fontSizeInput" type="range" min="20" max="56" step="1" />
+          </label>
+          <label>
+            <span>Color</span>
+            <input id="textColorInput" type="color" />
+          </label>
+          <button id="resetStyle" class="secondary">Reset</button>
         </div>
         <p class="hint">Ctrl+Alt+L toggles lock</p>
         <button id="unlockButton" class="unlock-button is-hidden" aria-label="Unlock lyrics">Lock</button>

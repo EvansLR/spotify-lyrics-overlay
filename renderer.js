@@ -9,6 +9,11 @@ const trackArtist = document.querySelector("#trackArtist");
 const lyrics = document.querySelector("#lyrics");
 const lockToggle = document.querySelector("#lockToggle");
 const unlockButton = document.querySelector("#unlockButton");
+const styleToggle = document.querySelector("#styleToggle");
+const stylePanel = document.querySelector("#stylePanel");
+const fontSizeInput = document.querySelector("#fontSizeInput");
+const textColorInput = document.querySelector("#textColorInput");
+const resetStyleButton = document.querySelector("#resetStyle");
 const lineModeToggle = document.querySelector("#lineModeToggle");
 const disconnectButton = document.querySelector("#disconnect");
 const quitButton = document.querySelector("#quit");
@@ -28,6 +33,7 @@ const state = {
   renderTimer: null,
   pollInFlight: false,
   requestSeq: 0,
+  style: loadStyleSettings(),
 };
 
 init();
@@ -64,6 +70,28 @@ lineModeToggle.addEventListener("click", () => {
   renderSyncedLyrics();
 });
 
+styleToggle.addEventListener("click", () => {
+  stylePanel.classList.toggle("is-hidden");
+});
+
+fontSizeInput.addEventListener("input", () => {
+  state.style.fontSize = clampNumber(Number(fontSizeInput.value), 20, 56);
+  saveStyleSettings();
+  applyStyleSettings();
+});
+
+textColorInput.addEventListener("input", () => {
+  state.style.color = normalizeColor(textColorInput.value, "#f6fff8");
+  saveStyleSettings();
+  applyStyleSettings();
+});
+
+resetStyleButton.addEventListener("click", () => {
+  state.style = defaultStyleSettings();
+  saveStyleSettings();
+  applyStyleSettings();
+});
+
 window.addEventListener("resize", () => {
   window.requestAnimationFrame(applyMarqueeIfNeeded);
 });
@@ -87,6 +115,7 @@ window.overlayApi.onSetLock((locked) => {
 
 async function init() {
   applyLineMode();
+  applyStyleSettings();
   const status = await window.overlayApi.authStatus();
   clientIdInput.value = status.clientId || "";
   if (status.connected) showLyrics();
@@ -288,6 +317,59 @@ function applyLineMode() {
   lineModeToggle.textContent = state.lineMode === "two" ? "2 lines" : "1 line";
   state.renderedCurrent = "";
   state.renderedNext = "";
+}
+
+function defaultStyleSettings() {
+  return {
+    fontSize: 38,
+    color: "#f6fff8",
+  };
+}
+
+function loadStyleSettings() {
+  const defaults = defaultStyleSettings();
+  try {
+    const saved = JSON.parse(localStorage.getItem("lyrics_style") || "{}");
+    return {
+      fontSize: clampNumber(Number(saved.fontSize || defaults.fontSize), 20, 56),
+      color: normalizeColor(saved.color, defaults.color),
+    };
+  } catch {
+    return defaults;
+  }
+}
+
+function saveStyleSettings() {
+  localStorage.setItem("lyrics_style", JSON.stringify(state.style));
+}
+
+function applyStyleSettings() {
+  const fontSize = clampNumber(Number(state.style.fontSize), 20, 56);
+  const nextSize = Math.max(14, Math.round(fontSize * 0.62));
+  document.documentElement.style.setProperty("--lyrics-size", `${fontSize}px`);
+  document.documentElement.style.setProperty("--lyrics-next-size", `${nextSize}px`);
+  document.documentElement.style.setProperty("--text", state.style.color);
+  document.documentElement.style.setProperty("--muted", hexToRgba(state.style.color, 0.58));
+  fontSizeInput.value = String(fontSize);
+  textColorInput.value = state.style.color;
+  window.requestAnimationFrame(applyMarqueeIfNeeded);
+}
+
+function clampNumber(value, min, max) {
+  if (!Number.isFinite(value)) return min;
+  return Math.min(max, Math.max(min, value));
+}
+
+function normalizeColor(value, fallback) {
+  return /^#[0-9a-f]{6}$/i.test(value || "") ? value.toLowerCase() : fallback;
+}
+
+function hexToRgba(hex, alpha) {
+  const normalized = normalizeColor(hex, "#f6fff8");
+  const red = parseInt(normalized.slice(1, 3), 16);
+  const green = parseInt(normalized.slice(3, 5), 16);
+  const blue = parseInt(normalized.slice(5, 7), 16);
+  return `rgba(${red}, ${green}, ${blue}, ${alpha})`;
 }
 
 function applyMarqueeIfNeeded() {
